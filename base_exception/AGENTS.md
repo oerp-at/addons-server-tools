@@ -26,6 +26,9 @@ model and register their own rules and checks.
   create/write/unlink of a rule must call `self.env.transaction.invalidate_ormcache()`,
   otherwise changed rules are not seen.
 - `ignore_exception` is reset by inheriting modules when the document changes again.
+- Rule menus (here and in `sale_exception` etc.) are restricted to
+  `group_exception_rule_manager`. Root and admin get the group on install, like Odoo's
+  own manager groups; every other user must be added explicitly (user form, debug mode).
 
 ## Pitfalls
 
