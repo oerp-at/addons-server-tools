@@ -1,14 +1,19 @@
 import logging
+import os
 from unittest import mock
 
 import psycopg2
 
-from odoo import http
+from odoo.http import session as http_session
 from odoo.sql_db import connection_info_for
 from odoo.tests import TransactionCase
 from odoo.tools import config
 
-from odoo.addons.session_db.pg_session_store import PGSessionStore
+from odoo.addons.session_db.pg_session_store import (
+    PGSessionStore,
+    SessionStoreFactory,
+    _check_sessions_db,
+)
 
 
 def _make_postgres_uri(
@@ -34,9 +39,8 @@ class TestPGSessionStore(TransactionCase):
     def setUp(self):
         super().setUp()
         _, connection_info = connection_info_for(config["db_name"][0])
-        self.session_store = PGSessionStore(
-            _make_postgres_uri(**connection_info), session_class=http.Session
-        )
+        self.uri = _make_postgres_uri(**connection_info)
+        self.session_store = PGSessionStore(self.uri, session_cls=http_session.Session)
 
     def test_session_crud(self):
         session = self.session_store.new()
@@ -55,7 +59,7 @@ class TestPGSessionStore(TransactionCase):
         ):
             mock_execute.side_effect = psycopg2.OperationalError()
             try:
-                self.session_store.get("abc")
+                self.session_store.get(self.session_store.generate_key())
             except psycopg2.OperationalError:  # pylint: disable=except-pass
                 pass
             else:
@@ -78,7 +82,7 @@ class TestPGSessionStore(TransactionCase):
             mock_db_connect.side_effect = RuntimeError("connection failed")
             # get fails, and a RuntimeError is raised when trying to reconnect
             try:
-                self.session_store.get("abc")
+                self.session_store.get(self.session_store.generate_key())
             except RuntimeError as e:  # pylint: disable=except-pass
                 assert str(e) == "connection failed"
             else:
@@ -128,3 +132,57 @@ class TestPGSessionStore(TransactionCase):
     def test_delete_from_identifiers_invalid_format(self):
         with self.assertRaises(ValueError):
             self.session_store.delete_from_identifiers("xxx")
+
+    def test_get_invalid_and_unknown_sid(self):
+        invalid = self.session_store.get("abc")
+        self.assertTrue(invalid.is_new)
+        self.assertNotEqual(invalid.sid, "abc")
+        sid = self.session_store.generate_key()
+        self.assertNotEqual(self.session_store.get(sid).sid, sid)
+        kept = self.session_store.get(sid, keep_sid=True)
+        self.assertEqual(kept.sid, sid)
+        self.assertFalse(kept.is_new)
+
+    def test_soft_rotate_keeps_session(self):
+        session = self.session_store.new()
+        session["test"] = "rotate"
+        self.session_store.save(session)
+        old_sid = session.sid
+        self.session_store.rotate(session, None, soft=True)
+        self.assertNotEqual(session.sid, old_sid)
+        self.assertEqual(session.sid[:42], old_sid[:42])
+        self.assertEqual(self.session_store.get(session.sid)["test"], "rotate")
+        self.assertEqual(self.session_store.get(old_sid)["next_sid"], session.sid)
+
+    def test_factory_returns_db_store(self):
+        with mock.patch.dict(os.environ, {"SESSION_DB_URI": self.uri}):
+            store = SessionStoreFactory(path=config.session_dir)
+        self.assertIsInstance(store, PGSessionStore)
+        with mock.patch.dict(os.environ, {"SESSION_DB_URI": ""}):
+            store = SessionStoreFactory(path=config.session_dir)
+        self.assertNotIsInstance(store, PGSessionStore)
+        self.assertEqual(store.path, config.session_dir)
+
+    def test_factory_keeps_subclasses(self):
+        class OtherStore(SessionStoreFactory):
+            pass
+
+        with mock.patch.dict(os.environ, {"SESSION_DB_URI": self.uri}):
+            store = OtherStore(path=config.session_dir)
+        self.assertIsInstance(store, OtherStore)
+
+    def test_check_sessions_db(self):
+        anonymous = self.session_store.new()
+        self.session_store.save(anonymous)
+        user = self.session_store.new()
+        user.uid = self.env.user.id
+        user.session_token = "wrong"
+        self.session_store.save(user)
+        unknown = self.session_store.new()
+        unknown.uid = self.env.user.id
+        with mock.patch.object(
+            http_session, "session_store", return_value=self.session_store
+        ):
+            resolved = _check_sessions_db(self.env.cr, [anonymous, user, unknown])
+        # no user: accepted without token; wrong token and unknown sid: dropped
+        self.assertEqual(set(resolved), {anonymous.sid})
